@@ -36,6 +36,7 @@ namespace VisualRust
             braceList.Add('{', '}');
             braceList.Add('[', ']');
             braceList.Add('(', ')');
+            braceList.Add('<', '>');
             this.View = view;
             this.SourceBuffer = sourceBuffer;
             this.CurrentChar = null;
