@@ -66,6 +66,8 @@
     <Compile Include="$(MSBuildThisFileDirectory)RustBraceMatcher.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)ProjectSystem\RustProjectFileGenerator.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)ProjectSystem\RustProjectSourceItemProviderExtensions.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)RustSignatureHelpCommandHandler.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)RustSignatureHelpSource.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Text\JoinedTextChange.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Text\RustClassifier.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Text\RustClassifierProvider.cs" />

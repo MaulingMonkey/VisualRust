@@ -7,6 +7,7 @@ using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Text.Editor;
 using Microsoft.VisualStudio.TextManager.Interop;
 using Microsoft.VisualStudio.Utilities;
+using System.Collections.Generic;
 
 namespace VisualRust
 {
@@ -24,6 +25,9 @@ namespace VisualRust
         [Import]
         internal ICompletionBroker CompletionBroker { get; set; }
 
+        [Import]
+        internal ISignatureHelpBroker SignatureHelpBroker { get; set; }
+
         public void VsTextViewCreated(IVsTextView textViewAdapter)
         {
             IWpfTextView textView = AdapterService.GetWpfTextView(textViewAdapter);
@@ -31,6 +35,7 @@ namespace VisualRust
                 return;
 
             textView.Properties.GetOrCreateSingletonProperty(() => new RustCompletionCommandHandler(textViewAdapter, textView, CompletionBroker));
+            textView.Properties.GetOrCreateSingletonProperty(() => new RustSignatureHelpCommandHandler(textViewAdapter, textView, SignatureHelpBroker));
             textView.Properties.GetOrCreateSingletonProperty(() => new RustCommentSelectionCommandHandler(textViewAdapter, textView));
             textView.Properties.GetOrCreateSingletonProperty(() => new RustF1HelpCommandHandler(textViewAdapter, textView));
             textView.Properties.GetOrCreateSingletonProperty(() => new RustGoToDefinitionCommandHandler(ServiceProvider, textViewAdapter, textView));
