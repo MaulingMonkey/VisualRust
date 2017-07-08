@@ -1,3 +1,4 @@
+using Antlr4.Runtime;
 using Microsoft.VisualStudio.Language.Intellisense;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Utilities;
@@ -47,11 +48,13 @@ namespace VisualRust {
     class RustSignatureHelpSource : ISignatureHelpSource
     {
         private readonly ITextBuffer TextBuffer;
+        private readonly Dictionary<KeyValuePair<int,int>, List<RacerMatch>> CompletionsCache = new Dictionary<KeyValuePair<int,int>, List<RacerMatch>>();
 
         public RustSignatureHelpSource(ITextBuffer textBuffer)
         {
             Trace("ctor");
             TextBuffer = textBuffer;
+            TextBuffer.Changed += TextBuffer_Changed;
         }
 
         public void Dispose()
@@ -61,6 +64,9 @@ namespace VisualRust {
 
         public void AugmentSignatureHelpSession(ISignatureHelpSession session, IList<ISignature> signatures)
         {
+            session.Dismissed -= Session_Dismissed; // Register at most once with the session
+            session.Dismissed += Session_Dismissed;
+
             // Apply the signature help session to just our current cursor position (N.B.: not our trigger point!)
             SnapshotPoint snapPoint = session.TextView.Caret.Position.BufferPosition;
             ITextSnapshot snapshot = snapPoint.Snapshot;
@@ -75,115 +81,61 @@ namespace VisualRust {
             Trace("      Line: '{0}'", lineText.Replace('\t',' '));
             Trace("  Position: {0}/\\", "".PadLeft(column, ' '));
 
-            var iBeforeHoverToken = tokens.FindLastIndex(token => token.StopIndex < column);
-            if (iBeforeHoverToken == -1)
+            IToken ident;
+            Span lineSpan;
+            int argIndex;
+            if (!TryFindIdentArgsSpan(lineText, tokens, column, out ident, out lineSpan, out argIndex))
             {
                 session.Dismiss();
                 return;
             }
+            ITrackingSpan applicableToSpan = snapshot.CreateTrackingSpan(lineSpan.Start + line.Start, lineSpan.Length, SpanTrackingMode.EdgeInclusive, TrackingFidelityMode.Forward);
 
-            // 1. Search 'backwards' in an attempt to find the start of the argument list
-            int parensEscaped = 0;
-            int parensEscapedMax = 0;
-            int commasPassedAtEscapedMax = 0;
-            int commasPassedAtEscapedMaxMinusOne = 0;
-
-            int? iSignatureHelpIdentToken = null;
-            for (int iToken = iBeforeHoverToken; iSignatureHelpIdentToken == null && iToken >= 0; --iToken)
+            var matches = GetRacerMatchesAt(snapshot, lineNo, ident.StopIndex);
+            foreach (var m in matches)
             {
-                var token = tokens[iToken];
-                switch (token.Type)
+                if (m.MatchString != ident.Text) continue;
+                switch (m.MatchType)
                 {
-                case RustLexer.RustLexer.LPAREN:
-                    if (++parensEscaped > parensEscapedMax)
+                case MatchType.Function:
                     {
-                        parensEscapedMax = parensEscaped;
-                        commasPassedAtEscapedMaxMinusOne = commasPassedAtEscapedMax;
-                        commasPassedAtEscapedMax = 0;
+                        var signature = CreateRustFunctionSignature(m);
+                        signature.ApplicableToSpan = applicableToSpan;
+                        signature.CurrentParameter = argIndex < signature.Parameters.Count ? signature.Parameters[argIndex] : signature.Parameters.LastOrDefault();
+                        signatures.Add(signature);
                     }
                     break;
-                case RustLexer.RustLexer.RPAREN:
-                    --parensEscaped;
+                default:
+                    Trace("{0} not yet handled", m.MatchType ?? "null");
                     break;
-                case RustLexer.RustLexer.COMMA:
-                    if (parensEscaped == parensEscapedMax) ++commasPassedAtEscapedMax;
-                    break;
-                case RustLexer.RustLexer.IDENT:
-                    if (parensEscaped <= 0) break; // iToken is part of a peer's child expression, ignore it
-                    if (iToken+1 < tokens.Count && tokens[iToken+1].Type == RustLexer.RustLexer.LPAREN) { iSignatureHelpIdentToken = iToken; break; } // ident(
-                    //if (iToken+2 < tokens.Count && tokens[iToken+1].Type == RustLexer.RustLexer.MOD_SEP && tokens[iToken+2].Type == RustLexer.RustLexer.LT) { iBackTrackToken = iToken; break; } // ident::<
-                    break;
-                // TODO: <> 'params' for generics
-                //case RustLexer.RustLexer.LT:
-                //case RustLexer.RustLexer.GT:
                 }
             }
+        }
 
-            if (iSignatureHelpIdentToken == null) // couldn't find an opening ident( to signature match for
-            {
-                session.Dismiss();
-                return;
-            }
+        private IEnumerable<RacerMatch> GetRacerMatchesAt(ITextSnapshot snapshot, int lineNo, int colNo)
+        {
+            var pos = new KeyValuePair<int,int>(lineNo, colNo);
 
-            // 2. Search forwards in an attempt to find the matching closing parens, if any, to complete the relevant span.
-            parensEscaped = 0;
-            int? iEndParenToken = null;
-            for (int iToken=iBeforeHoverToken+1; iEndParenToken == null && iToken < tokens.Count; ++iToken)
-            {
-                var token = tokens[iToken];
-                switch (token.Type)
-                {
-                case RustLexer.RustLexer.LPAREN:
-                    --parensEscaped;
-                    break;
-                case RustLexer.RustLexer.RPAREN:
-                    if (++parensEscaped == parensEscapedMax) iEndParenToken = iToken;
-                    break;
-                // TODO: <> 'params' for generics
-                //case RustLexer.RustLexer.LT:
-                //case RustLexer.RustLexer.GT:
-                }
-            }
+            List<RacerMatch> matches = null;
+            if (CompletionsCache.TryGetValue(pos, out matches)) return matches;
 
-            // 3. Construct applicable to range.
-            var ident = tokens[iSignatureHelpIdentToken.Value].Text;
-            // Currently including parens:
-            var start = tokens[iSignatureHelpIdentToken.Value+1].StartIndex;
-            var stop  = iEndParenToken == null ? lineText.Length-1 : tokens[iEndParenToken.Value].StopIndex;
-            ITrackingSpan applicableToSpan = snapshot.CreateTrackingSpan(new Span(line.Start + start, stop - start + 1), SpanTrackingMode.EdgeInclusive, TrackingFidelityMode.Forward);
-
+            matches = new List<RacerMatch>();
+            CompletionsCache.Add(pos, matches);
             ITextDocument document = null;
             snapshot?.TextBuffer?.Properties?.TryGetProperty(typeof(ITextDocument), out document);
             using (var temp = new TemporaryFile(snapshot.GetText()))
             {
-                var racerCompleteArgs = string.Format("complete-with-snippet {0} {1} \"{2}\" \"{3}\"", lineNo, tokens[iSignatureHelpIdentToken.Value].StopIndex, document?.FilePath ?? temp.Path, temp.Path);
-                var racerCompleteMatches = RacerSingleton.Run(racerCompleteArgs); // TODO: Cache the result of this for performance.
+                var racerCompleteArgs = string.Format("complete-with-snippet {0} {1} \"{2}\" \"{3}\"", lineNo, colNo, document?.FilePath ?? temp.Path, temp.Path);
+                var racerCompleteMatches = RacerSingleton.Run(racerCompleteArgs);
                 foreach (var racerMatchLine in racerCompleteMatches.Split('\n'))
                 {
                     RacerMatch m;
                     if (!RacerMatch.TryParse(racerMatchLine, RacerMatch.Type.CompleteWithSnippet, RacerMatch.Interface.Default, out m)) continue;
-                    if (m.MatchString != ident) continue;
                     if (!LegalSignatureMatchTypes.Contains(m.MatchType)) continue;
-
-                    switch (m.MatchType)
-                    {
-                    case MatchType.Function:
-                        {
-                            var signature = CreateRustFunctionSignature(m);
-                            signature.ApplicableToSpan = applicableToSpan;
-                            signature.CurrentParameter = commasPassedAtEscapedMaxMinusOne < signature.Parameters.Count ? signature.Parameters[commasPassedAtEscapedMaxMinusOne] : signature.Parameters.LastOrDefault();
-                            signatures.Add(signature);
-                        }
-                        break;
-                    default:
-                        Trace("{0} not yet handled", m.MatchType ?? "null");
-                        break;
-                    }
+                    matches.Add(m);
                 }
             }
-
-            Trace("  scopes: {0}", parensEscapedMax);
-            Trace("  commas: {0}", commasPassedAtEscapedMaxMinusOne);
+            return matches;
         }
 
         public ISignature GetBestMatch(ISignatureHelpSession session)
@@ -224,6 +176,99 @@ namespace VisualRust {
             MatchType.Type,        // generic <>s?
             MatchType.Trait        // generic <>s?
         });
+
+        private void TextBuffer_Changed(object sender, TextContentChangedEventArgs e)
+        {
+            Trace("TextBuffer_Changed");
+            // TODO: Remove only completions after the edit point?
+            CompletionsCache.Clear();
+        }
+
+        private void Session_Dismissed(object sender, EventArgs e)
+        {
+            Trace("Session_Dismissed");
+            // Since we're not currently checking if / responding to other files are modified, be extremely conservative about how long we cache completions for.
+            CompletionsCache.Clear();
+        }
+
+        private static bool TryFindIdentArgsSpan(string lineText, List<IToken> tokens, int column, out IToken ident, out Span lineSpan, out int argIndex)
+        {
+            ident    = null;
+            lineSpan = default(Span);
+            argIndex = -1;
+
+            var iBeforeHoverToken = tokens.FindLastIndex(token => token.StopIndex < column);
+            if (iBeforeHoverToken == -1) return false;
+
+            // 1. Search 'backwards' in an attempt to find the start of the argument list
+            int parensEscaped = 0;
+            int parensEscapedMax = 0;
+            int commasPassedAtEscapedMax = 0;
+            int commasPassedAtEscapedMaxMinusOne = 0;
+
+            int? iSignatureHelpIdentToken = null;
+            for (int iToken = iBeforeHoverToken; iSignatureHelpIdentToken == null && iToken >= 0; --iToken)
+            {
+                var token = tokens[iToken];
+                switch (token.Type)
+                {
+                case RustLexer.RustLexer.LPAREN:
+                    if (++parensEscaped > parensEscapedMax)
+                    {
+                        parensEscapedMax = parensEscaped;
+                        commasPassedAtEscapedMaxMinusOne = commasPassedAtEscapedMax;
+                        commasPassedAtEscapedMax = 0;
+                    }
+                    break;
+                case RustLexer.RustLexer.RPAREN:
+                    --parensEscaped;
+                    break;
+                case RustLexer.RustLexer.COMMA:
+                    if (parensEscaped == parensEscapedMax) ++commasPassedAtEscapedMax;
+                    break;
+                case RustLexer.RustLexer.IDENT:
+                    if (parensEscaped <= 0) break; // iToken is part of a peer's child expression, ignore it
+                    if (iToken+1 < tokens.Count && tokens[iToken+1].Type == RustLexer.RustLexer.LPAREN) { iSignatureHelpIdentToken = iToken; break; } // ident(
+                    //if (iToken+2 < tokens.Count && tokens[iToken+1].Type == RustLexer.RustLexer.MOD_SEP && tokens[iToken+2].Type == RustLexer.RustLexer.LT) { iBackTrackToken = iToken; break; } // ident::<
+                    break;
+                // TODO: <> 'params' for generics
+                //case RustLexer.RustLexer.LT:
+                //case RustLexer.RustLexer.GT:
+                }
+            }
+
+            if (iSignatureHelpIdentToken == null) return false; // couldn't find an opening ident( to signature match for
+
+            // 2. Search forwards in an attempt to find the matching closing parens, if any, to complete the relevant span.
+            parensEscaped = 0;
+            int? iEndParenToken = null;
+            for (int iToken=iBeforeHoverToken+1; iEndParenToken == null && iToken < tokens.Count; ++iToken)
+            {
+                var token = tokens[iToken];
+                switch (token.Type)
+                {
+                case RustLexer.RustLexer.LPAREN:
+                    --parensEscaped;
+                    break;
+                case RustLexer.RustLexer.RPAREN:
+                    if (++parensEscaped == parensEscapedMax) iEndParenToken = iToken;
+                    break;
+                // TODO: <> 'params' for generics
+                //case RustLexer.RustLexer.LT:
+                //case RustLexer.RustLexer.GT:
+                }
+            }
+
+            // 3. Construct applicable to range.
+            ident = tokens[iSignatureHelpIdentToken.Value];
+            // Currently including parens:
+            var start = tokens[iSignatureHelpIdentToken.Value+1].StartIndex;
+            var stop  = iEndParenToken == null ? lineText.Length-1 : tokens[iEndParenToken.Value].StopIndex;
+            lineSpan = new Span(start, stop-start+1);
+            argIndex = commasPassedAtEscapedMaxMinusOne;
+
+            return true;
+        }
 
         private static IEnumerable<string> ParseSnippetArgs(RacerMatch match)
         {
